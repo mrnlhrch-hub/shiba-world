@@ -1,0 +1,86 @@
+name: Build Android app
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Pack game files into www (3D + multiplayer libraries bundled inside the app)
+        run: |
+          mkdir -p www
+          cp index.html icon-192.png icon-512.png www/
+          curl -fsSL -o www/three.min.js https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js
+          curl -fsSL -o www/peerjs.min.js https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js
+          test $(wc -c < www/three.min.js) -gt 100000
+          test $(wc -c < www/peerjs.min.js) -gt 20000
+          python3 - <<'PY'
+          import re
+          s = open('www/index.html', encoding='utf-8').read()
+          s = s.replace('https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js', 'three.min.js')
+          s = re.sub(r"<script>if\(!window\.Peer\)document\.write\(.*?</script>\n", '', s)
+          s = re.sub(r"<script>if\('serviceWorker'.*?</script>\n?", '', s)
+          marker = "<script>\n// Standalone multiplayer shim"
+          assert marker in s
+          s = s.replace(marker, '<script src="peerjs.min.js"></script>\n' + marker, 1)
+          s = re.sub(r'<link rel="manifest"[^>]*>\n', '', s)
+          open('www/index.html', 'w', encoding='utf-8').write(s)
+          PY
+
+      - name: Create Android project
+        run: |
+          cat > package.json <<'JSON'
+          {"name":"shiba-world","version":"1.0.0","private":true,"dependencies":{"@capacitor/core":"^6.2.0","@capacitor/cli":"^6.2.0","@capacitor/android":"^6.2.0"}}
+          JSON
+          cat > capacitor.config.json <<'JSON'
+          {"appId":"com.shiba.world","appName":"Shiba World","webDir":"www"}
+          JSON
+          npm install
+          npx cap add android
+          npx cap sync android
+
+      - name: Use the Shiba icon
+        continue-on-error: true
+        run: |
+          pip install pillow
+          python3 - <<'PY'
+          import os
+          from PIL import Image
+          src = Image.open('icon-512.png').convert('RGBA')
+          sizes = {'mdpi': (48, 108), 'hdpi': (72, 162), 'xhdpi': (96, 216), 'xxhdpi': (144, 324), 'xxxhdpi': (192, 432)}
+          for d, (n, f) in sizes.items():
+              p = f'android/app/src/main/res/mipmap-{d}'
+              if not os.path.isdir(p):
+                  continue
+              src.resize((n, n), Image.LANCZOS).save(f'{p}/ic_launcher.png')
+              src.resize((n, n), Image.LANCZOS).save(f'{p}/ic_launcher_round.png')
+              fg = Image.new('RGBA', (f, f), (0, 0, 0, 0))
+              k = int(f * 0.62)
+              fg.paste(src.resize((k, k), Image.LANCZOS), ((f - k) // 2, (f - k) // 2))
+              fg.save(f'{p}/ic_launcher_foreground.png')
+          PY
+
+      - name: Build APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shiba-world-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
